@@ -1,0 +1,491 @@
+---
+- name: Set up web server environment
+  hosts: node6
+  become: yes
+  tasks:
+    - name: Check if swapfile exists
+      stat:
+        path: /swapfile
+      register: swapfile_check
+
+    - name: Create swapfile if not already created
+      command: "fallocate -l 2G /swapfile"
+      when: not swapfile_check.stat.exists
+
+    - name: Change permissions for swapfile
+      command: "chmod 600 /swapfile"
+      when: not swapfile_check.stat.exists
+
+    - name: Set up swapspace on swapfile
+      command: "mkswap /swapfile"
+      when: not swapfile_check.stat.exists
+
+    - name: Enable swapfile
+      command: "swapon /swapfile"
+      when: not swapfile_check.stat.exists
+
+    - name: Ensure swapfile entry in fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "/swapfile swap swap defaults 0 0"
+        create: yes
+        state: present
+    - name: Temporarily set SELinux to permissive
+      command: setenforce 0
+
+    - name: Ensure SELinux config file is in permissive mode
+      replace:
+        path: /etc/selinux/config
+        regexp: '^SELINUX='
+        replace: 'SELINUX=permissive'
+
+    - name: Install wget
+      yum:
+        name: wget
+        state: present
+
+    - name: Download MariaDB repo setup script with retries
+      get_url:
+        url: https://r.mariadb.com/downloads/mariadb_repo_setup
+        dest: /tmp/mariadb_repo_setup
+        mode: '0755'
+      register: download_result
+      retries: 3
+      delay: 10
+      until: download_result is succeeded
+
+    - name: Verify the MariaDB repo setup script checksum
+      command: >
+        sha256sum -c -
+      args:
+        stdin: "30d2a05509d1c129dd7dd8430507e6a7729a4854ea10c9dcf6be88964f3fdc25 /tmp/mariadb_repo_setup"
+      register: checksum_result
+      failed_when: checksum_result.rc != 0
+    - name: Run the MariaDB repo setup script
+      command: /tmp/mariadb_repo_setup --mariadb-server-version="mariadb-10.6"
+      args:
+        creates: /etc/yum.repos.d/mariadb.repo
+
+    - name: Ensure MariaDB repository is present
+      yum_repository:
+        name: MariaDB
+        description: "MariaDB Repository"
+        baseurl: "http://yum.mariadb.org/10.6/rhel7-amd64"
+        gpgkey: "https://yum.mariadb.org/RPM-GPG-KEY-MariaDB"
+        enabled: yes
+        gpgcheck: yes
+
+    - name: Install MariaDB server and backup
+      yum:
+        name:
+          - MariaDB-server
+          - MariaDB-backup
+        state: present
+
+    - name: Start and enable MariaDB service
+      service:
+        name: mariadb
+        state: started
+        enabled: yes
+
+    - name: Install MySQL Python library
+      package:
+        name: python3-PyMySQL
+        state: present
+    - name: Ensure .my.cnf is present
+      copy:
+        content: |
+          [client]
+          user=root
+          password=123
+        dest: /root/.my.cnf
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Ensure MySQL is running
+      service:
+        name: mysql
+        state: started
+        enabled: yes
+
+    - name: Set MySQL root user to use password authentication
+      mysql_user:
+        name: root
+        host: localhost
+        password: 123
+        priv: '*.*:ALL,GRANT'
+        login_user: root
+        login_password: 123
+        state: present
+        plugin: mysql_native_password
+    - name: Secure MySQL installation
+      block:
+       - name: Set MySQL root password
+         mysql_user:
+            name: root
+            host: localhost
+            password: 123
+            login_user: root
+            login_password: 123
+
+    - name: Remove anonymous users
+      mysql_user:
+            name: ''
+            host: localhost
+            state: absent
+            login_user: root
+            login_password: 123
+
+    - name: Disallow root login remotely
+      mysql_user:
+            name: root
+            host: "{{ item }}"
+            state: absent
+            login_user: root
+            login_password: 123
+      with_items:
+            - "{{ ansible_hostname }}"
+            - '127.0.0.1'
+            - '::1'
+    - name: Remove the test database
+      mysql_db:
+            name: test
+            state: absent
+            login_user: root
+            login_password: 123
+
+
+    - name: Install PHP 8 and related packages
+      yum:
+        name:
+          - php
+          - php-fpm
+          - php-mysqlnd
+        state: present
+
+    - name: Start and enable PHP-FPM service
+      service:
+        name: php-fpm
+        state: started
+        enabled: yes
+
+    - name: Update all packages
+      dnf:
+        name: '*'
+        state: latest
+
+    - name: Install Nginx
+      dnf:
+        name: nginx
+        state: present
+    - name: Start and enable Nginx service
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Create user rajin
+      user:
+        name: rajin
+        password: "{{ '123' | password_hash('sha512') }}"
+        home: /home/rajin
+        createhome: yes
+
+    - name: Create project directory structure
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: rajin
+        group: rajin
+        mode: '0755'
+      with_items:
+        - /home/rajin/myproject
+        - /home/rajin/myproject/public
+
+    - name: Set ownership of project directory to nginx
+      file:
+        path: /home/rajin/myproject
+        state: directory
+        owner: nginx
+        group: nginx
+        recurse: yes
+
+    - name: Ensure correct permissions for project directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      with_items:
+        - /home/rajin
+        - /home/rajin/myproject
+        - /home/rajin/myproject/public
+
+    - name: Set SELinux context for the public directory
+      command: chcon -R -t httpd_sys_content_t /home/rajin/myproject/public
+
+    - name: Create a sample index.php file
+      copy:
+        dest: /home/rajin/myproject/public/index.php
+        content: |
+          <?php
+          phpinfo();
+          ?>
+        owner: nginx
+        group: nginx
+        mode: '0644'
+    - name: Edit /etc/php-fpm.d/www.conf
+      lineinfile:
+        path: /etc/php-fpm.d/www.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: "{{ item.state }}"
+      loop:
+        - { regexp: '^listen = ', line: 'listen = /var/run/php-fpm/www.sock', state: 'present' }
+        - { regexp: '^user = ', line: 'user = nginx', state: 'present' }
+        - { regexp: '^group = ', line: 'group = nginx', state: 'present' }
+        - { regexp: '^listen.owner = ', line: 'listen.owner = nginx', state: 'present' }
+        - { regexp: '^listen.group = ', line: 'listen.group = nginx', state: 'present' }
+      notify:
+        - restart php-fpm
+
+    - name: Create Nginx configuration file from template
+      template:
+        src: mynginx.conf.j2
+        dest: /etc/nginx/conf.d/real.conf
+      notify:
+        - restart nginx
+
+
+    - name: Install OpenSSH server
+      yum:
+        name: openssh-server
+        state: present
+
+    - name: Start and enable SSH service
+      service:
+        name: sshd
+        state: started
+        enabled: yes
+    - name: Edit SSH configuration file
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ANSIBLE MANAGED BLOCK {{ item }}"
+        block: |
+          Match User rajin
+             ForceCommand internal-sftp
+             PasswordAuthentication yes
+             ChrootDirectory /home/abhishek
+             PermitTunnel no
+             AllowAgentForwarding no
+             AllowTcpForwarding no
+             X11Forwarding no
+      loop_control:
+        loop_var: item
+      loop:
+          - placeholder
+
+    - name: Set ownership and permissions for /home/rajin
+      file:
+        path: /home/rajin
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create uploads directory
+      file:
+        path: /home/rajin/myfiles
+        state: directory
+        owner: rajin
+        group: rajin
+        mode: '0755'
+    - name: Restart SSH service
+      service:
+        name: sshd
+        state: restarted
+
+    - name: Import GPG key for EPEL repository
+      rpm_key:
+        state: present
+        key: https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-9
+    - name: Install EPEL repository
+      yum:
+        name: "https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm"
+        state: present
+
+    - name: Check available repositories
+      command: sudo subscription-manager repos --list
+      register: repos_output
+      ignore_errors: yes
+
+    - name: Enable codeready-builder-for-rhel-9-x86_64-rpms repository
+      command: sudo subscription-manager repos --enable codeready-builder-for-rhel-9-x86_64-rpms
+      when: "'codeready-builder-for-rhel-9-x86_64-rpms' not in repos_output.stdout"
+
+
+    - name: Install phpMyAdmin
+      dnf:
+        name: phpmyadmin
+        state: present
+
+    - name: Create symlink for phpMyAdmin
+      file:
+        src: /usr/share/phpMyAdmin
+        dest: /usr/share/nginx/html/phpmyadmin
+        state: link
+    - name: Set ownership for phpMyAdmin
+      file:
+        path: /usr/share/phpMyAdmin
+        owner: nginx
+        group: nginx
+        recurse: yes
+
+    - name: Set permissions for phpMyAdmin
+      file:
+        path: /usr/share/phpMyAdmin
+        mode: '0755'
+        recurse: yes
+
+    - name: Set ownership and permissions for session directory
+      file:
+        path: /var/lib/php/session
+        owner: root
+        group: nginx
+        mode: '0770'
+        recurse: yes
+
+    - name: Set SELinux context for session directory
+      command: chcon -R -t httpd_sys_rw_content_t /var/lib/php/session
+
+
+    - name: Create WordPress database
+      mysql_db:
+        name: wordpress
+        state: present
+
+    - name: Create MySQL user 'rajin' with password '123'
+      mysql_user:
+        name: rajin
+        password: 123
+        priv: 'wordpress.*:ALL'
+        host: localhost
+        state: present
+
+    - name: Flush privileges
+      mysql_db:
+        name: wordpress
+        login_user: root
+        login_password: 123
+        login_host: localhost
+        state: present
+
+    - name: Install wget
+      yum:
+        name: wget
+        state: present
+
+    - name: Download WordPress
+      command: wget https://wordpress.org/latest.tar.gz -O /tmp/latest.tar.gz
+      args:
+        creates: /tmp/latest.tar.gz
+
+    - name: Extract WordPress to a temporary directory
+      unarchive:
+        src: /tmp/latest.tar.gz
+        dest: /tmp/
+        remote_src: yes
+    - name: Create target directory if it doesn't exist
+      file:
+        path: /home/rajin/myproject/public/
+        state: directory
+        owner: nginx
+        group: nginx
+        mode: '0755'
+
+    - name: Copy WordPress to the project directory
+      command: cp -r /tmp/wordpress/ /home/rajin/myproject/public/
+      become_user: nginx
+
+    - name: Set ownership of WordPress files
+      file:
+        path: /home/rajin/myproject/public/wordpress
+        state: directory
+        owner: nginx
+        group: nginx
+        recurse: yes
+
+    - name: Set permissions of WordPress files
+      file:
+        path: /home/rajin/myproject/public/wordpress
+        state: directory
+        mode: '0755'
+        recurse: yes
+
+    - name: Copy wp-config-sample.php to wp-config.php
+      copy:
+        src: /home/rajin/myproject/public/wordpress/wp-config-sample.php
+        dest: /home/rajin/myproject/public/wordpress/wp-config.php
+        remote_src: yes
+    - name: Update DB_NAME in wp-config.php
+      lineinfile:
+        path: /home/rajin/myproject/public/wordpress/wp-config.php
+        regexp: "define\\( *'DB_NAME', *'.*' *\\);"
+        line: "define('DB_NAME', 'wordpress');"
+
+
+    - name: Update DB_USER in wp-config.php
+      lineinfile:
+        path: /home/rajin/myproject/public/wordpress/wp-config.php
+        regexp: "define\\( *'DB_USER', *'.*' *\\);"
+        line: "define('DB_USER', 'rajin');"
+
+    - name: Update DB_PASSWORD in wp-config.php
+      lineinfile:
+        path: /home/rajin/myproject/public/wordpress/wp-config.php
+        regexp: "define\\( *'DB_PASSWORD', *'.*' *\\);"
+        line: "define('DB_PASSWORD', '123');"
+
+    - name: Update DB_HOST in wp-config.php
+      lineinfile:
+        path: /home/rajin/myproject/public/wordpress/wp-config.php
+        regexp: "define\\( *'DB_HOST', *'.*' *\\);"
+        line: "define('DB_HOST', 'localhost');"
+
+    - name: Ensure correct ownership and permissions on wp-config.php
+      file:
+        path: /home/rajin/myproject/public/wordpress/wp-config.php
+        owner: nginx
+        group: nginx
+        mode: '0644'
+
+    - name: Install Certbot and Nginx plugin
+      yum:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - certbot
+        - python3-certbot-nginx
+
+    - name: Obtain SSL certificate using Certbot
+      command: certbot --nginx -d real.rajin.shop --non-interactive --agree-tos --email rajinpm360@gmail.com
+
+    - name: Add WP_DEBUG, WP_HOME, and WP_SITEURL to wp-config.php
+      ansible.builtin.lineinfile:
+        path: /home/rajin/myproject/public/wordpress/wp-config.php
+        line: "{{ item }}"
+        insertafter: EOF
+      loop:
+        - "define( 'WP_DEBUG', false );"
+        - "define( 'WP_HOME', 'https://real.rajin.shop' );"
+        - "define( 'WP_SITEURL', 'https://real.rajin.shop' );"
+
+  handlers:
+    - name: restart php-fpm
+      service:
+        name: php-fpm
+        state: restarted
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
+
